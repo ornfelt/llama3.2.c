@@ -1,4 +1,6 @@
-/* Inference for Llama-2 Transformer model in pure C */
+/* Inference for Llama-3 Transformer model in pure C */
+
+//#define USE_PCRE 0
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,7 +9,11 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+
+#if USE_PCRE
 #include <pcre.h> // for regex splits in tokenizer
+#endif
+
 #if defined _WIN32
     #include "win.h"
 #else
@@ -450,6 +456,7 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     return res != NULL ? res->id : -1;
 }
 
+#if USE_PCRE
 void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
@@ -510,7 +517,14 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
             if (normal_match < 0) break;
 
             size_t normal_match_len = ovector[1] - ovector[0];
+#ifdef _WIN32
+            // Windows: MSVC doesn't support VLAs, use malloc
+            char* matched_str = (char*)malloc(normal_match_len + 1);
+            if (!matched_str) { fprintf(stderr, "malloc failed\n"); exit(EXIT_FAILURE); }
+#else
+            // Unix/Linux/Mac: Use VLA (faster, stack-allocated)
             char matched_str[normal_match_len+1];
+#endif
             strncpy(matched_str, text + idx, normal_match_len);
             matched_str[normal_match_len] = '\0';
 
@@ -608,13 +622,23 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
                     tokens[(*n_tokens)++] = split_tokens[j];
                 }
             }
+#ifdef _WIN32
+            free(matched_str);
+#endif
             // move position past this matched sequence
             idx += normal_match_len;
         }
 
         // now add the special token if one was found
         if (special_match >= 0) {
+#ifdef _WIN32
+            // Windows: MSVC doesn't support VLAs, use malloc
+            char* matched_str = (char*)malloc(special_match_len + 1);
+            if (!matched_str) { fprintf(stderr, "malloc failed\n"); exit(EXIT_FAILURE); }
+#else
+            // Unix/Linux/Mac: Use VLA (faster, stack-allocated)
             char matched_str[special_match_len + 1];
+#endif
             strncpy(matched_str, text + idx, special_match_len);
             matched_str[special_match_len] = '\0';
 
@@ -622,7 +646,9 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
             if (special_token_id != -1) {
                 tokens[(*n_tokens)++] = special_token_id;
             }
-
+#ifdef _WIN32
+            free(matched_str);
+#endif
             idx += special_match_len;
         }
     }
@@ -634,6 +660,309 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     pcre_free(re_special);
     pcre_free(re_normal);
 }
+#else
+// Replace the encode function with this version that doesn't use PCRE
+// Helper function to check if a character is a letter (simplified Unicode support)
+static int is_letter(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= 0x80); // 0x80+ for extended ASCII/UTF-8
+}
+
+// Helper function to check if a character is a digit
+static int is_digit(unsigned char c) {
+    return c >= '0' && c <= '9';
+}
+
+// Helper function to check if character is whitespace
+static int is_whitespace(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+// Check if we're at the start of a special token
+static int match_special_token(const char* text, size_t pos, size_t text_len, size_t* match_len) {
+    const char* special_tokens[] = {
+        "<|begin_of_text|>",
+        "<|end_of_text|>",
+        "<|start_header_id|>",
+        "<|end_header_id|>",
+        "<|eot_id|>",
+        NULL
+    };
+    
+    for (int i = 0; special_tokens[i] != NULL; i++) {
+        size_t len = strlen(special_tokens[i]);
+        if (pos + len <= text_len && strncmp(text + pos, special_tokens[i], len) == 0) {
+            *match_len = len;
+            return 1;
+        }
+    }
+    
+    // Check for reserved special tokens: <|reserved_special_token_N|> where N is 0-250
+    if (pos + 3 < text_len && 
+        text[pos] == '<' && text[pos+1] == '|' && 
+        strncmp(text + pos + 2, "reserved_special_token_", 23) == 0) {
+        size_t check_pos = pos + 25;
+        if (check_pos < text_len && is_digit(text[check_pos])) {
+            int num = 0;
+            size_t num_start = check_pos;
+            while (check_pos < text_len && is_digit(text[check_pos])) {
+                num = num * 10 + (text[check_pos] - '0');
+                check_pos++;
+            }
+            if (num <= 250 && check_pos + 2 <= text_len && 
+                text[check_pos] == '|' && text[check_pos+1] == '>') {
+                *match_len = check_pos + 2 - pos;
+                return 1;
+            }
+        }
+    }
+    
+    return 0;
+}
+
+// Match normal tokens according to the Llama 3 regex pattern
+// Pattern: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+static size_t match_normal_token(const char* text, size_t pos, size_t end) {
+    if (pos >= end) return 0;
+    
+    unsigned char c = text[pos];
+    size_t start = pos;
+    
+    // Check for contractions: 's, 't, 're, 've, 'm, 'll, 'd (case insensitive)
+    if (c == '\'' || c == '\'') {
+        if (pos + 1 < end) {
+            char next = tolower(text[pos + 1]);
+            if (next == 's' || next == 't' || next == 'm' || next == 'd') {
+                return 2;
+            }
+            if (pos + 2 < end) {
+                char next2 = tolower(text[pos + 2]);
+                if ((next == 'r' && next2 == 'e') ||
+                    (next == 'v' && next2 == 'e') ||
+                    (next == 'l' && next2 == 'l')) {
+                    return 3;
+                }
+            }
+        }
+    }
+    
+    // Match letters: [^\r\n\p{L}\p{N}]?\p{L}+
+    if (is_letter(c)) {
+        pos++;
+        while (pos < end && is_letter(text[pos])) {
+            pos++;
+        }
+        return pos - start;
+    }
+    
+    // Optional non-letter prefix + letters
+    if (!is_letter(c) && !is_digit(c) && c != '\r' && c != '\n') {
+        if (pos + 1 < end && is_letter(text[pos + 1])) {
+            pos += 2;
+            while (pos < end && is_letter(text[pos])) {
+                pos++;
+            }
+            return pos - start;
+        }
+    }
+    
+    // Match 1-3 digits: \p{N}{1,3}
+    if (is_digit(c)) {
+        int count = 0;
+        while (pos < end && is_digit(text[pos]) && count < 3) {
+            pos++;
+            count++;
+        }
+        return pos - start;
+    }
+    
+    // Match whitespace patterns: \s*[\r\n]+
+    if (c == '\r' || c == '\n') {
+        while (pos > start && is_whitespace(text[pos - 1]) && 
+               text[pos - 1] != '\r' && text[pos - 1] != '\n') {
+            start--;
+        }
+        while (pos < end && (text[pos] == '\r' || text[pos] == '\n')) {
+            pos++;
+        }
+        return pos - start;
+    }
+    
+    // Match: \s+(?!\S) - whitespace not followed by non-whitespace (end of string scenario)
+    // or: \s+ - general whitespace
+    if (is_whitespace(c)) {
+        pos++;
+        while (pos < end && is_whitespace(text[pos])) {
+            pos++;
+        }
+        return pos - start;
+    }
+    
+    // Match: " ?[^\s\p{L}\p{N}]+[\r\n]*" - optional space + non-letter/digit/space chars + optional newlines
+    int has_leading_space = 0;
+    if (c == ' ') {
+        has_leading_space = 1;
+        pos++;
+        if (pos >= end) return 1;
+        c = text[pos];
+    }
+    
+    if (!is_whitespace(c) && !is_letter(c) && !is_digit(c)) {
+        pos++;
+        while (pos < end && !is_whitespace(text[pos]) && 
+               !is_letter(text[pos]) && !is_digit(text[pos])) {
+            pos++;
+        }
+        // Optional trailing newlines
+        while (pos < end && (text[pos] == '\r' || text[pos] == '\n')) {
+            pos++;
+        }
+        return pos - start;
+    }
+    
+    if (has_leading_space) return 1; // Just the space
+    
+    // Default: consume one character
+    return 1;
+}
+
+void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+    if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
+
+    if (t->sorted_vocab == NULL) {
+        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+        for (int i = 0; i < t->vocab_size; i++) {
+            t->sorted_vocab[i].str = t->vocab[i];
+            t->sorted_vocab[i].id = i;
+        }
+        qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
+    }
+
+    char* str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char));
+    size_t str_len = 0;
+    *n_tokens = 0;
+
+    if (bos) tokens[(*n_tokens)++] = 128000;
+
+    size_t idx = 0;
+    size_t text_len = strlen(text);
+
+    while (idx < text_len) {
+        // Check for special tokens
+        size_t special_len = 0;
+        if (match_special_token(text, idx, text_len, &special_len)) {
+#ifdef _WIN32
+            char* matched_str = (char*)malloc(special_len + 1);
+            if (!matched_str) { fprintf(stderr, "malloc failed\n"); exit(EXIT_FAILURE); }
+#else
+            char matched_str[special_len + 1];
+#endif
+            strncpy(matched_str, text + idx, special_len);
+            matched_str[special_len] = '\0';
+            
+            int special_token_id = str_lookup(matched_str, t->sorted_vocab, t->vocab_size);
+            if (special_token_id != -1) {
+                tokens[(*n_tokens)++] = special_token_id;
+            }
+#ifdef _WIN32
+            free(matched_str);
+#endif
+            idx += special_len;
+            continue;
+        }
+
+        // Match normal token
+        size_t match_len = match_normal_token(text, idx, text_len);
+        if (match_len == 0) {
+            idx++;
+            continue;
+        }
+
+#ifdef _WIN32
+        char* matched_str = (char*)malloc(match_len + 1);
+        if (!matched_str) { fprintf(stderr, "malloc failed\n"); exit(EXIT_FAILURE); }
+#else
+        char matched_str[match_len + 1];
+#endif
+        strncpy(matched_str, text + idx, match_len);
+        matched_str[match_len] = '\0';
+
+        int token_id = str_lookup(matched_str, t->sorted_vocab, t->vocab_size);
+
+        if (token_id != -1) {
+            tokens[(*n_tokens)++] = token_id;
+        } else {
+            // BPE encoding
+            int split_tokens[1024];
+            int split_n_tokens = 0;
+
+            str_len = 0;
+            for (size_t j = 0; j < match_len; j++) {
+                char c = matched_str[j];
+                
+                if ((c & 0xC0) != 0x80) {
+                    str_len = 0;
+                }
+
+                str_buffer[str_len++] = c;
+                str_buffer[str_len] = '\0';
+
+                if (j + 1 < match_len && (matched_str[j+1] & 0xC0) == 0x80 && str_len < 4) {
+                    continue;
+                }
+
+                int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+                if (id != -1) {
+                    split_tokens[split_n_tokens++] = id;
+                } else {
+                    for (int k = 0; k < str_len; k++) {
+                        split_tokens[split_n_tokens++] = (unsigned char)str_buffer[k];
+                    }
+                }
+                str_len = 0;
+            }
+
+            // BPE merge
+            while (1) {
+                float best_score = 1e10;
+                int best_id = -1;
+                int best_idx = -1;
+
+                for (int j = 0; j < split_n_tokens - 1; j++) {
+                    sprintf(str_buffer, "%s%s", t->vocab[split_tokens[j]], t->vocab[split_tokens[j + 1]]);
+                    int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+
+                    if (id != -1 && t->vocab_scores[id] < best_score) {
+                        best_score = t->vocab_scores[id];
+                        best_id = id;
+                        best_idx = j;
+                    }
+                }
+
+                if (best_idx == -1) break;
+
+                split_tokens[best_idx] = best_id;
+                for (int j = best_idx + 1; j < split_n_tokens - 1; j++) {
+                    split_tokens[j] = split_tokens[j + 1];
+                }
+                split_n_tokens--;
+            }
+
+            for (int j = 0; j < split_n_tokens; j++) {
+                tokens[(*n_tokens)++] = split_tokens[j];
+            }
+        }
+
+#ifdef _WIN32
+        free(matched_str);
+#endif
+        idx += match_len;
+    }
+
+    if (eos) tokens[(*n_tokens)++] = 128001;
+
+    free(str_buffer);
+}
+#endif
 
 // ----------------------------------------------------------------------------
 // The Sampler, which takes logits and returns a sampled token
@@ -979,6 +1308,29 @@ void error_usage() {
     exit(EXIT_FAILURE);
 }
 
+// Helper function to check if file exists
+int file_exists(const char *path) {
+    #if defined _WIN32
+        return _access(path, 0) == 0;
+    #else
+        return access(path, F_OK) == 0;
+    #endif
+}
+
+// Helper function to get parent directory (modifies path in place)
+void get_parent_dir(char *path) {
+    // Find the last slash or backslash
+    char *last_slash = strrchr(path, '/');
+    char *last_backslash = strrchr(path, '\\');
+    
+    // Use whichever is later in the string
+    char *sep = (last_slash > last_backslash) ? last_slash : last_backslash;
+    
+    if (sep != NULL) {
+        *sep = '\0';  // Terminate at the separator
+    }
+}
+
 int main(int argc, char *argv[]) {
 
     // default parameters
@@ -993,7 +1345,34 @@ int main(int argc, char *argv[]) {
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse so we can override the defaults above from the command line
+#if 0
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
+#else
+	if (argc >= 2) {
+		checkpoint_path = argv[1];
+
+		// Check if default tokenizer exists, otherwise use parent directory of checkpoint
+		if (!file_exists(tokenizer_path) && checkpoint_path != NULL) {
+			static char tokenizer_buf[2048];
+			char checkpoint_dir[2048];
+
+			// Copy checkpoint path and get its parent directory (C:/path/out/model.bin" -> "C:/path/out")
+			strncpy(checkpoint_dir, checkpoint_path, sizeof(checkpoint_dir) - 1);
+			checkpoint_dir[sizeof(checkpoint_dir) - 1] = '\0';
+			get_parent_dir(checkpoint_dir);
+
+			get_parent_dir(checkpoint_dir);
+
+			snprintf(tokenizer_buf, sizeof(tokenizer_buf), "%s/tokenizer.bin", checkpoint_dir);
+			tokenizer_path = tokenizer_buf;
+
+			printf("Tokenizer not found at default path, using: %s\n", tokenizer_path);
+		}
+	}
+	else {
+		error_usage();
+	}
+#endif
     for (int i = 2; i < argc; i+=2) {
         // do some basic validation
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag

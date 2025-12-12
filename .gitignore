@@ -1,2 +1,9 @@
 .venv
-__pycache__
+__pycache__/
+data/
+out/
+build/
+*.exe
+*.obj
+Llama*.bin
+pcre.h
