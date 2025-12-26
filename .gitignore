@@ -7,3 +7,5 @@ build/
 *.obj
 Llama*.bin
 pcre.h
+run
+runq
