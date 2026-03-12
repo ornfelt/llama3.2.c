@@ -22,6 +22,10 @@ from tokenizer import Tokenizer
 
 DATA_CACHE_DIR = "data"
 
+# Llama 3 BOS/EOS token IDs
+LLAMA3_BOS_ID = 128000  # <|begin_of_text|>
+LLAMA3_EOS_ID = 128001  # <|end_of_text|>
+
 def download_file(url: str, fname: str, chunk_size=1024):
     """Helper function to download a file from a given url"""
     resp = requests.get(url, stream=True)
@@ -124,10 +128,89 @@ def train_vocab(vocab_size):
     print("Done.")
 
 
-def process_shard(args, vocab_size):
+def _get_llama3_tokenizer():
+    """
+    Returns a tiktoken-based Llama 3 tokenizer.
+    Requires the tokenizer.model file from Meta's Llama 3 release.
+    We look for it at DATA_CACHE_DIR/llama3_tokenizer.model or the path
+    set via the LLAMA3_TOKENIZER_PATH env var.
+    """
+    try:
+        import tiktoken
+        from tiktoken.load import load_tiktoken_bpe
+    except ImportError:
+        raise ImportError(
+            "tiktoken is required for Llama 3 tokenization. "
+            "Install it with: pip install tiktoken"
+        )
+
+    tokenizer_path = os.environ.get(
+        "LLAMA3_TOKENIZER_PATH",
+        os.path.join(DATA_CACHE_DIR, "llama3_tokenizer.model")
+    )
+    if not os.path.exists(tokenizer_path):
+        raise FileNotFoundError(
+            f"Llama 3 tokenizer not found at {tokenizer_path}. "
+            f"Download it from Meta's Llama 3 release and place it there, "
+            f"or set LLAMA3_TOKENIZER_PATH env var."
+        )
+
+    mergeable_ranks = load_tiktoken_bpe(tokenizer_path)
+
+    # Special tokens for Llama 3
+    num_base_tokens = len(mergeable_ranks)
+    special_tokens = {
+        "<|begin_of_text|>": 128000,
+        "<|end_of_text|>": 128001,
+        "<|start_header_id|>": 128006,
+        "<|end_header_id|>": 128007,
+        "<|eot_id|>": 128009,
+    }
+    # Reserved special tokens 0-250
+    for i in range(256):
+        token = f"<|reserved_special_token_{i}|>"
+        if token not in special_tokens:
+            special_tokens[token] = 128002 + i  # fills gaps from 128002
+
+    enc = tiktoken.Encoding(
+        name="llama3",
+        pat_str=r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        mergeable_ranks=mergeable_ranks,
+        special_tokens=special_tokens,
+    )
+    return enc
+
+
+class Llama3Tokenizer:
+    """Thin wrapper around tiktoken to match the Tokenizer interface used here."""
+
+    def __init__(self):
+        self.enc = _get_llama3_tokenizer()
+        self.bos_id = LLAMA3_BOS_ID
+        self.eos_id = LLAMA3_EOS_ID
+
+    def encode(self, text, bos=False, eos=False):
+        tokens = self.enc.encode(text, allowed_special=set())
+        if bos:
+            tokens = [self.bos_id] + tokens
+        if eos:
+            tokens = tokens + [self.eos_id]
+        return tokens
+
+
+def process_shard(args, vocab_size, vocab_source="llama2"):
     shard_id, shard = args
-    tokenizer_model = get_tokenizer_model_path(vocab_size)
-    enc = Tokenizer(tokenizer_model)
+
+    if vocab_source == "llama3":
+        enc = Llama3Tokenizer()
+        bos_id = LLAMA3_BOS_ID
+        token_dtype = np.uint32  # llama3 token IDs exceed uint16 range
+    else:
+        tokenizer_model = get_tokenizer_model_path(vocab_size)
+        enc = Tokenizer(tokenizer_model)
+        bos_id = 1
+        token_dtype = np.uint16
+
     with open(shard, "r") as f:
         data = json.load(f)
     all_tokens = []
@@ -136,10 +219,16 @@ def process_shard(args, vocab_size):
         text = text.strip()  # get rid of leading/trailing whitespace
         tokens = enc.encode(text, bos=True, eos=False)  # encode the text, use BOS
         all_tokens.extend(tokens)
-    # convert to uint16 nparray
-    all_tokens = np.array(all_tokens, dtype=np.uint16)
+    # convert to nparray
+    all_tokens = np.array(all_tokens, dtype=token_dtype)
     # calculate the output filename
-    if vocab_size == 0:
+    if vocab_source == "llama3":
+        # save .bin files into a llama3_tok directory
+        bin_dir = os.path.join(DATA_CACHE_DIR, "llama3_tok")
+        shard_basename = os.path.basename(shard)
+        bin_basename = shard_basename.replace(".json", ".bin")
+        tokenized_filename = os.path.join(bin_dir, bin_basename)
+    elif vocab_size == 0:
         # if we're using Llama 2, just save the tokenized file in the same dir
         tokenized_filename = shard.replace(".json", ".bin")
     else:
@@ -151,22 +240,26 @@ def process_shard(args, vocab_size):
     # write the bytes
     with open(tokenized_filename, "wb") as f:
         f.write(all_tokens.tobytes())
-    # calculate the average sequence length (they are separated by BOS=1)
-    avg_seq_len = all_tokens.size / ((all_tokens == 1).sum())
+    # calculate the average sequence length (they are separated by BOS token)
+    avg_seq_len = all_tokens.size / ((all_tokens == bos_id).sum())
     print(f"Saved {tokenized_filename}, average seqlen: {avg_seq_len:.2f}")
 
 
-def pretokenize(vocab_size):
+def pretokenize(vocab_size, vocab_source="llama2"):
     # iterate the shards and tokenize all of them one by one
     data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
-    if vocab_size > 0:
+
+    if vocab_source == "llama3":
+        bin_dir = os.path.join(DATA_CACHE_DIR, "llama3_tok")
+        os.makedirs(bin_dir, exist_ok=True)
+    elif vocab_size > 0:
         # .bin files will be saved into tok{N} directory, create it once here
         bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}")
         os.makedirs(bin_dir, exist_ok=True)
 
     # process all the shards in a process pool
-    fun = partial(process_shard, vocab_size=vocab_size)
+    fun = partial(process_shard, vocab_size=vocab_size, vocab_source=vocab_source)
     with ProcessPoolExecutor() as executor:
         executor.map(fun, enumerate(shard_filenames))
     print("Done.")
@@ -192,14 +285,23 @@ class PretokDataset(torch.utils.data.IterableDataset):
         seed = 42 + worker_id + 1337 * rank
         rng = random.Random(seed)
         print(f"Created a PretokDataset with rng seed {seed}")
-        if self.vocab_source == "llama2":
+
+        # determine bin directory and dtype based on vocab source
+        if self.vocab_source == "llama3":
+            bin_dir = os.path.join(DATA_CACHE_DIR, "llama3_tok")
+            token_dtype = np.uint32
+        elif self.vocab_source == "llama2":
             # the .bin files are right along the .json files
             bin_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
-            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
+            token_dtype = np.uint16
         elif self.vocab_source == "custom":
             # the .bin files are in tok{N} directory
             bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{self.vocab_size}")
-            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
+            token_dtype = np.uint16
+        else:
+            raise ValueError(f"Unknown vocab_source: {self.vocab_source}")
+
+        shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
         # train/test split. let's use only shard 0 for test split, rest train
         shard_filenames = shard_filenames[1:] if self.split == "train" else shard_filenames[:1]
         assert len(shard_filenames)>0, f"No bin files found in {bin_dir}"
@@ -207,7 +309,7 @@ class PretokDataset(torch.utils.data.IterableDataset):
             rng.shuffle(shard_filenames)
             for shard in shard_filenames:
                 # open the dataset for reading but keep it on disk with memmap
-                m = np.memmap(shard, dtype=np.uint16, mode="r")
+                m = np.memmap(shard, dtype=token_dtype, mode="r")
                 num_batches = len(m) // self.max_seq_len
                 num_batches -= 1  # drop the last partial batch
                 assert num_batches > 0, "this shard is way too small? investigate."
@@ -260,6 +362,10 @@ if __name__ == "__main__":
     python tinystories.py download
     python tinystories.py pretokenize
 
+    To tokenize data with the Llama 3 tokenizer:
+    python tinystories.py download
+    python tinystories.py pretokenize --vocab_source=llama3
+
     To tokenize data with a custom tokenizer we train ourselves with sentencepiece, e.g.:
     python tinystories.py download
     python tinystories.py train_vocab --vocab_size=2048
@@ -268,6 +374,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("stage", type=str, choices=["download", "pretokenize", "train_vocab"])
     parser.add_argument("--vocab_size", type=int, default=0, help="pretokenization vocab size. 0 = use Llama 2 tokenizer.")
+    parser.add_argument("--vocab_source", type=str, default="llama2", choices=["llama2", "llama3", "custom"],
+                        help="tokenizer to use: llama2, llama3, or custom")
     args = parser.parse_args()
 
     # depending on the stage call the appropriate function
@@ -276,6 +384,6 @@ if __name__ == "__main__":
     elif args.stage == "train_vocab":
         train_vocab(vocab_size=args.vocab_size)
     elif args.stage == "pretokenize":
-        pretokenize(vocab_size=args.vocab_size)
+        pretokenize(vocab_size=args.vocab_size, vocab_source=args.vocab_source)
     else:
         raise ValueError(f"Unknown stage {args.stage}")
