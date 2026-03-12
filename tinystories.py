@@ -249,6 +249,12 @@ def pretokenize(vocab_size, vocab_source="llama2"):
     # iterate the shards and tokenize all of them one by one
     data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
+    if len(shard_filenames) == 0:
+        print(f"ERROR: No .json shard files found in {data_dir}")
+        print("Did you run 'python tinystories.py download' first?")
+        return
+
+    print(f"Found {len(shard_filenames)} shards to tokenize with vocab_source={vocab_source}")
 
     if vocab_source == "llama3":
         bin_dir = os.path.join(DATA_CACHE_DIR, "llama3_tok")
@@ -261,7 +267,7 @@ def pretokenize(vocab_size, vocab_source="llama2"):
     # process all the shards in a process pool
     fun = partial(process_shard, vocab_size=vocab_size, vocab_source=vocab_source)
     with ProcessPoolExecutor() as executor:
-        executor.map(fun, enumerate(shard_filenames))
+        list(executor.map(fun, enumerate(shard_filenames)))  # list() forces execution & surfaces errors
     print("Done.")
 
 
