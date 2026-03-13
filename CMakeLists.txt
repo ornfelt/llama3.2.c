@@ -14,10 +14,19 @@ option(USE_PCRE "Enable PCRE regex support" OFF)
 find_package(OpenMP REQUIRED)
 
 # Add the executable
-add_executable(llama3 run.c win.c)
+#add_executable(llama3 run.c win.c)
+set(LLAMA3_SOURCES run.c)
+if(WIN32)
+  list(APPEND LLAMA3_SOURCES win.c)
+endif()
+add_executable(llama3 ${LLAMA3_SOURCES})
 
 # Link OpenMP
 target_link_libraries(llama3 PRIVATE OpenMP::OpenMP_C)
+# Linux/Unix: math functions (sqrtf/expf/etc)
+if(NOT MSVC)
+  target_link_libraries(llama3 PRIVATE m)
+endif()
 
 # Include current directory for headers
 target_include_directories(llama3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
