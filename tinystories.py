@@ -245,14 +245,18 @@ def process_shard(args, vocab_size, vocab_source="llama2"):
     print(f"Saved {tokenized_filename}, average seqlen: {avg_seq_len:.2f}")
 
 
-def pretokenize(vocab_size, vocab_source="llama2"):
-    # iterate the shards and tokenize all of them one by one
+def pretokenize(vocab_size, vocab_source="llama2", max_shards=0):
     data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
     if len(shard_filenames) == 0:
         print(f"ERROR: No .json shard files found in {data_dir}")
         print("Did you run 'python tinystories.py download' first?")
         return
+
+    # Limit shards if requested
+    if max_shards > 0 and max_shards < len(shard_filenames):
+        print(f"Limiting to {max_shards} of {len(shard_filenames)} shards (--max_shards={max_shards})")
+        shard_filenames = shard_filenames[:max_shards]
 
     print(f"Found {len(shard_filenames)} shards to tokenize with vocab_source={vocab_source}")
 
@@ -382,6 +386,7 @@ if __name__ == "__main__":
     parser.add_argument("--vocab_size", type=int, default=0, help="pretokenization vocab size. 0 = use Llama 2 tokenizer.")
     parser.add_argument("--vocab_source", type=str, default="llama2", choices=["llama2", "llama3", "custom"],
                         help="tokenizer to use: llama2, llama3, or custom")
+    parser.add_argument("--max_shards", type=int, default=0, help="only tokenize first N shards (0 = all)")
     args = parser.parse_args()
 
     # depending on the stage call the appropriate function
@@ -390,6 +395,6 @@ if __name__ == "__main__":
     elif args.stage == "train_vocab":
         train_vocab(vocab_size=args.vocab_size)
     elif args.stage == "pretokenize":
-        pretokenize(vocab_size=args.vocab_size, vocab_source=args.vocab_source)
+        pretokenize(vocab_size=args.vocab_size, vocab_source=args.vocab_source, max_shards=args.max_shards)
     else:
         raise ValueError(f"Unknown stage {args.stage}")
