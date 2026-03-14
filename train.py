@@ -36,7 +36,7 @@ from export import model_export
 out_dir = "out"
 #eval_interval = 2000
 #eval_interval = 400
-eval_interval = 300
+eval_interval = 200
 log_interval = 1
 #eval_iters = 100
 eval_iters = 10
@@ -49,7 +49,7 @@ wandb_project = "llamac"
 wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
 #batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
-batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 8
 max_seq_len = 256
 vocab_source = "llama3" # llama2|llama3|custom; use Llama 2/3 vocab from Meta, or custom trained
 vocab_size = 128256 # the Llama 3 tokenizer has 128K tokens (Llama 2 had 32K)
@@ -77,7 +77,7 @@ warmup_iters = 1000  # how many steps to warm up for
 device = "cpu"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
 #compile = True  # use PyTorch 2.0 to compile the model to be faster
-compile = False  # use PyTorch 2.0 to compile the model to be faster
+compile = False
 # -----------------------------------------------------------------------------
 config_keys = [
     k
