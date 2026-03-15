@@ -2,6 +2,8 @@
 __pycache__/
 data/
 out/
+data_old/
+out_old/
 build/
 *.exe
 *.obj
