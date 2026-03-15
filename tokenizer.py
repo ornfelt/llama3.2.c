@@ -112,8 +112,8 @@ class Tokenizer:
         """
         assert type(s) is str
 
-        self.model.encode(
-            substr,
+        t = self.model.encode(
+            s,
             allowed_special=allowed_special,
             disallowed_special=disallowed_special,
         )
